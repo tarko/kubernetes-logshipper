@@ -1,0 +1,133 @@
+#!/usr/bin/ruby
+require "logger"
+require "optparse"
+require 'file/tail'
+require "time"
+require "json"
+require "socket"
+require "pp"
+
+class LogShipper
+	def initialize(options)
+		@options = options
+		@queue = Queue.new
+	end
+
+	def run
+		LOGGER.info("LogShipper ready")
+
+		Thread.new { LogSender.new(@options, @queue).run }
+
+		threads = {}
+
+		loop do
+			newfiles = list_files
+			LOGGER.debug(list_files)
+
+			(threads.keys - newfiles).each do |file|
+				LOGGER.info("Logfile removed #{file}")
+
+				thread = threads.delete(file)
+				Thread.kill(thread)
+			end
+
+			(newfiles - threads.keys).each do |file|
+				LOGGER.info("Logfile added #{file}")
+
+				threads[file] = Thread.new { LogTailer.new(file, @queue).run }
+			end
+
+			LOGGER.info("Queue length %s" % [@queue.length]) if @queue.length > 50
+			sleep 5
+		end
+	end
+
+	def list_files
+		Dir.glob(File.join(@options[:logdir], "*.log"))
+	end
+end
+
+class LogTailer
+	def initialize(file, queue)
+		@file = file
+		@queue = queue
+
+		metadata = File.basename(file).split("_")
+		@pod = metadata[0]
+		@namespace = metadata[1]
+
+		@hostname = Socket.gethostname
+	end
+
+	def run
+		begin
+			File::Tail::Logfile.open(@file, :backward => 0) do |log|
+				log.tail do |line|
+					rawmsg = JSON.parse(line)
+
+					msg = {
+						"message" => rawmsg["log"].strip,
+						"source" => @hostname,
+						"timestamp" => Time.parse(rawmsg["time"]).utc.to_i,
+						"application_name" => "docker-container",
+						"docker_stream" => rawmsg["stream"],
+						"kubernetes_pod" => @pod,
+						"kubernetes_namespace" => @namespace,
+					}
+
+					@queue << msg
+				end
+			end
+		rescue => ex
+			LOGGER.error(ex)
+			sleep 5
+			retry
+		end
+	end
+end
+
+class LogSender
+	def initialize(options, queue)
+		@options = options
+		@queue = queue
+	end
+
+	def run
+		begin
+			sock = UDPSocket.new
+
+			LOGGER.info("LogSender ready")
+
+			while msg = @queue.pop do
+				LOGGER.debug(msg)
+				sock.send(msg.to_json, 0, @options[:hostname], @options[:port])
+			end
+		rescue => ex
+			LOGGER.error(ex)
+			sleep 5
+			retry
+		end
+	end
+end
+
+
+options = {}
+
+OptionParser.new do |o|
+	o.on("-h hostname", String, "Syslog server hostname") { |h| options[:hostname] = h }
+	o.on("-p port", Integer, "Syslog server port") { |p| options[:port] = p }
+	o.on("-l logdir", String, "Kubelet logdir") { |l| options[:logdir] = l }
+	o.on("-d", "Debug") { |d| options[:debug] = true }
+end.parse!
+
+raise "Hostname required" unless options[:hostname]
+raise "Port required" unless options[:port]
+raise "Logdir required" unless options[:logdir]
+
+LOGGER = Logger.new(STDOUT)
+LOGGER.level = options[:debug] ? Logger::DEBUG : Logger::INFO
+LOGGER.info("Startup")
+
+Thread::abort_on_exception = true
+
+LogShipper.new(options).run
